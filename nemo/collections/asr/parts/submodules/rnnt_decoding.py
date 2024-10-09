@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from nemo.collections.asr.parts.submodules import rnnt_beam_decoding, rnnt_greedy_decoding, tdt_beam_decoding
+from nemo.collections.asr.parts.submodules import rnnt_beam_decoding, rnnt_greedy_decoding, tdt_beam_decoding, tdt_batched_beam_decoding
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceConfig, ConfidenceMixin
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses
 from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateTokenizer
@@ -440,10 +440,11 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         hat_ilm_weight=self.cfg.beam.get('hat_ilm_weight', 0.0),
                     )
                 else:
-                    self.decoding = tdt_beam_decoding.BeamTDTInfer(
+                    self.decoding = tdt_batched_beam_decoding.BeamTDTInferBatched(
                         decoder_model=decoder,
                         joint_model=joint,
                         durations=self.durations,
+                        blank_index=self.blank_id,
                         beam_size=self.cfg.beam.beam_size,
                         return_best_hypothesis=decoding_cfg.beam.get('return_best_hypothesis', True),
                         search_type='maes',
@@ -456,6 +457,14 @@ class AbstractRNNTDecoding(ConfidenceMixin):
                         preserve_alignments=self.preserve_alignments,
                         ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
                         ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.3),
+                        max_symbols_per_step=(
+                            self.cfg.greedy.get('max_symbols', None)
+                            or self.cfg.greedy.get('max_symbols_per_step', None)
+                        ),
+                        preserve_frame_confidence=self.preserve_frame_confidence,
+                        include_duration_confidence=self.tdt_include_duration_confidence,
+                        confidence_method_cfg=self.confidence_method_cfg,
+                        use_cuda_graph_decoder=self.cfg.greedy.get('use_cuda_graph_decoder', True)
                     )
         else:
 

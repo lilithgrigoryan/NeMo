@@ -805,3 +805,7 @@ class BeamTDTInfer(Typing):
             return sorted(hyps, key=lambda x: x.score / len(x.y_sequence), reverse=True)
         else:
             return sorted(hyps, key=lambda x: x.score, reverse=True)
+        
+        
+        
+    
