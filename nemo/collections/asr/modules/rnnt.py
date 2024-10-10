@@ -862,6 +862,21 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
             )
         return state
 
+    def batch_initialize_state(self, y: torch.Tensor, beam_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch = y.size(0)
+        if self.random_state_sampling and self.training:
+            state = (
+                torch.randn(self.pred_rnn_layers, batch * beam_size, self.pred_hidden, dtype=y.dtype, device=y.device),
+                torch.randn(self.pred_rnn_layers, batch * beam_size, self.pred_hidden, dtype=y.dtype, device=y.device),
+            )
+        else:
+            state = (
+                torch.zeros(self.pred_rnn_layers, batch * beam_size, self.pred_hidden, dtype=y.dtype, device=y.device),
+                torch.zeros(self.pred_rnn_layers, batch * beam_size, self.pred_hidden, dtype=y.dtype, device=y.device),
+            )
+        return state
+
+
     def score_hypothesis(
         self, hypothesis: rnnt_utils.Hypothesis, cache: Dict[Tuple[int], Any]
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:

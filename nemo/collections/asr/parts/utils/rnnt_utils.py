@@ -425,22 +425,25 @@ class BatchedBeamHyps:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
         self._max_length = init_length
 
+        self.beam_size=beam_size
+        self.batch_size = batch_size
+
         # batch of current lengths of hypotheses and correspoinding timesteps
-        self.current_lengths = torch.zeros((batch_size, beam_size), device=device, dtype=torch.long)
+        self.current_lengths = torch.zeros(batch_size * beam_size, device=device, dtype=torch.long)
         # tensor for storing transcripts
-        self.transcript = torch.zeros((batch_size, beam_size, self._max_length), device=device, dtype=torch.long)
+        self.transcript = torch.zeros((batch_size * beam_size, self._max_length), device=device, dtype=torch.long)
         # tensor for storing timesteps corresponding to transcripts
-        self.timesteps = torch.zeros((batch_size, beam_size, self._max_length), device=device, dtype=torch.long)
+        self.timesteps = torch.zeros((batch_size * beam_size, self._max_length), device=device, dtype=torch.long)
         # accumulated scores for hypotheses
-        self.scores = torch.zeros(batch_size, beam_size, device=device, dtype=float_dtype)
+        self.scores = torch.zeros(batch_size * beam_size, device=device, dtype=float_dtype)
 
         # tracking last timestep of each hyp to avoid infinite looping (when max symbols per frame is restricted)
         # last observed timestep (with label) for each hypothesis
-        self.last_timestep = torch.full((batch_size, beam_size), -1, device=device, dtype=torch.long)
+        self.last_timestep = torch.full((batch_size * beam_size, ), -1, device=device, dtype=torch.long)
         # number of labels for the last timestep
-        self.last_timestep_lasts = torch.zeros((batch_size, beam_size), device=device, dtype=torch.long)
-        self._batch_indices = torch.arange((batch_size, beam_size), device=device)
-        self._ones_batch = torch.ones_like(self._batch_indices)
+        self.last_timestep_lasts = torch.zeros(batch_size * beam_size, device=device, dtype=torch.long)
+        self._batch_indices = torch.arange(batch_size * beam_size, device=device)
+        self._ones_batch = torch.ones_like(self._batch_indices * beam_size)
 
     def clear_(self):
         self.current_lengths.fill_(0)
@@ -567,6 +570,29 @@ class BatchedBeamHyps:
         torch.where(active_mask, time_indices, self.last_timestep, out=self.last_timestep)
         # increase lengths
         self.current_lengths += active_mask
+        
+    def get_best_hypotheses(self) -> List[Hypothesis]:
+        num_hyps = self.scores.shape[0] / self.beam_size if self.beam_size is None else self.batch_size
+        hypotheses = []
+        for i in range(num_hyps):
+            beam = [Hypothesis(
+                score=self.scores[beam_idx].item(),
+                y_sequence=self.transcript[beam_idx, : self.current_lengths[beam_idx]],
+                timestep=self.timesteps[beam_idx, : self.current_lengths[beam_idx]],
+                alignments=None,
+                dec_state=None,
+            ) for beam_idx in range(i*self.beam_size, (i+1)*self.beam_size)]
+            beam = sorted(beam, key= lambda x: x.score, reverse=True)
+            hypotheses.append(beam[0])
+            
+        return hypotheses
+        
+    def print(self):
+        torch.set_printoptions(profile="full")
+        for _ in range(self.batch_size):
+            print(f"Hyp: {_}")
+            for idx in range(self.beam_size):
+                print(f"{idx}. Score: {self.scores[idx]}, Labels: {self.transcript[idx][:self.last_timestep[-1].item()+1]}")
 
 
 class BatchedAlignments:
@@ -804,3 +830,22 @@ def batched_hyps_to_hypotheses(
                     )
                 start += timestep_cnt
     return hypotheses
+
+
+def batched_beam_hyps_to_hypotheses(
+    batched_hyps: BatchedBeamHyps, alignments: Optional[BatchedAlignments] = None, batch_size=None
+) -> List[Hypothesis]:
+    """
+    Convert batched hypotheses to a list of Hypothesis objects.
+    Keep this function separate to allow for jit compilation for BatchedHyps class (see tests)
+
+    Args:
+        batched_hyps: BatchedHyps object
+        alignments: BatchedAlignments object, optional; must correspond to BatchedHyps if present
+        batch_size: Batch Size to retrieve hypotheses. When working with CUDA graphs the batch size for all tensors
+            is constant, thus we need here the real batch size to return only necessary hypotheses
+
+    Returns:
+        list of Hypothesis objects
+    """
+    return batched_hyps.get_best_hypotheses()

@@ -204,6 +204,10 @@ class AbstractRNNTDecoder(NeuralModule, ABC):
                 H = Hidden size of RNN.
         """
         raise NotImplementedError()
+    
+    @abstractmethod
+    def batch_initialize_state(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError()
 
     @abstractmethod
     def score_hypothesis(
