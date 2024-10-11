@@ -514,7 +514,7 @@ class BatchedBeamHyps:
         self.current_lengths[active_indices] += 1
 
     def add_results_masked_(
-        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor, batch_idx: torch.Tensor
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses.
@@ -532,7 +532,7 @@ class BatchedBeamHyps:
         )
 
     def add_results_masked_no_checks_(
-        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
+        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor, batch_idx: torch.Tensor
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses without checks.
