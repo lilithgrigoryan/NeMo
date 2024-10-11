@@ -527,6 +527,8 @@ class BatchedBeamHyps:
         """
         if (self.current_lengths + active_mask).max() >= self._max_length:
             self._allocate_more()
+        self.transcript = self.transcript.view(self.batch_size, self.beam_size)
+        
         self.add_results_masked_no_checks_(
             active_mask=active_mask, labels=labels, time_indices=time_indices, scores=scores
         )

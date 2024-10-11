@@ -1077,6 +1077,20 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         torch.where(mask.unsqueeze(0).unsqueeze(-1), src_states[1].to(dtype), dst_states[1], out=dst_states[1])
 
     @classmethod
+    def batch_rearrange_states(
+        cls,
+        src_states: Tuple[torch.Tensor, torch.Tensor],
+        indices: torch.Tensor,
+    ):
+        """Replace states in dst_states with states from src_states using the mask"""
+        # same as `dst_states[i][mask] = src_states[i][mask]`, but non-blocking
+        # we need to cast, since LSTM is calculated in fp16 even if autocast to bfloat16 is enabled
+        dtype = src_states[0].dtype
+        indices = indices.squeeze()
+        torch.index_select(src_states[0].to(dtype), dim=1, index=indices)
+        torch.index_select(src_states[1].to(dtype), dim=1, index=indices)
+        
+    @classmethod
     def batch_replace_states_all(
         cls,
         src_states: Tuple[torch.Tensor, torch.Tensor],

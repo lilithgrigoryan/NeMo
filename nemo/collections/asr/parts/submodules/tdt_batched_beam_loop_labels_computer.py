@@ -300,17 +300,18 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
 
             # stage 2: get joint output, iteratively seeking for non-blank labels
             # blank label in `labels` tensor means "end of hypothesis" (for this index)
-            logits = (
-                self.joint.joint_after_projection(
-                    encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
-                    decoder_output,
-                )
-                .squeeze(1)
-                .squeeze(1)
-            )
+            logits = self.joint.joint_after_projection(encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),decoder_output).squeeze(1).squeeze(1)
+            label_logits = logits[:, :-num_durations]
+            duration_logits = logits[:, -num_durations:]
             
-            labels, durations, batch_idx, scores = self._get_label_expansions(batched_hyps, logits, all_durations, is_first_expansion=is_first_label)
+            # Compute log probabilities for labels and durations
+            label_logp = torch.log_softmax(label_logits, dim=-1)
+            duration_logp = torch.log_softmax(duration_logits, dim=-1)
+            
+            labels, durations, beam_idx, scores = self._get_label_expansions(batched_hyps, label_logp, duration_logp, all_durations, is_first_label)
 
+            self.decoder.batch_rearrange_states(src_states=state, indices=beam_idx)
+            
             # search for non-blank labels using joint, advancing time indices for blank labels
             # checking max_symbols is not needed, since we already forced advancing time indices for such cases
             blank_mask = labels == self._blank_index
@@ -340,8 +341,13 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                 )
                 # get labels (greedy) and scores from current logits, replace labels/scores with new
                 # labels[advance_mask] are blank, and we are looking for non-blank labels
-                more_labels, durations, batch_idx, more_scores = self._get_label_expansions(batched_hyps, logits, all_durations, is_first_expansion=False)
+                more_labels, durations, more_batch_idx, more_scores = self._get_label_expansions(batched_hyps,
+                                                                                                 logits[:, :-num_durations],
+                                                                                                 logits[:, -num_durations:],
+                                                                                                 all_durations,
+                                                                                                 is_first_expansion=False)
 
+                self.decoder.batch_rearrange_states(src_states=state, indices=more_batch_idx)
                 # same as: labels[advance_mask] = more_labels[advance_mask], but non-blocking
                 torch.where(advance_mask, more_labels, labels, out=labels)
                 # same as: scores[advance_mask] = more_scores[advance_mask], but non-blocking
@@ -376,6 +382,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     labels,
                     time_indices_current_labels,
                     scores,
+                    batch_idx=more_batch_idx
                 )
             else:
                 # auto-adjusted storage
@@ -384,6 +391,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     labels,
                     time_indices_current_labels,
                     scores,
+                    batch_idx=more_batch_idx
                 )
 
             # stage 4: to avoid looping, go to next frame after max_symbols emission
@@ -406,48 +414,81 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                 # same as: active_mask = time_indices < encoder_output_length
                 torch.less(time_indices, encoder_output_length, out=active_samples_mask)
         return batched_hyps, None, last_decoder_state
-    
-    def _get_label_expansions(self, batched_hyps: rnnt_utils.BatchedBeamHyps, logits: torch.Tensor, all_durations: torch.Tensor, is_first_expansion: bool):
-        num_durations = all_durations.shape[0]
-        # Get top-k label and duration scores
-        scores, labels = logits[:, :-num_durations].topk(self.beam_size)
-        duration_scores = logits[:, -num_durations:]
-        
-        # Compute log probabilities for labels and durations
-        label_logp = torch.log_softmax(scores, dim=-1)
-        duration_logp = torch.log_softmax(duration_scores, dim=-1)
 
-        # is_first_expansion = False
+    def _get_label_expansions(self,
+                              batched_hyps: rnnt_utils.BatchedBeamHyps,
+                              label_logp: torch.Tensor,
+                              duration_logp: torch.Tensor,
+                              all_durations: torch.Tensor,
+                              is_first_expansion: bool):
+        label_logp, labels = label_logp.topk(self.beam_size, dim=-1)            # [ BATCH * BEAM, BEAM]
+        combined_logp = label_logp[:, :, None] + duration_logp[:, None, :]      # [ BATCH * BEAM, BEAM, DURATIONS]
+        combined_logp = combined_logp.view(combined_logp.shape[0], -1)          # [ BATCH * BEAM, BEAM*DURATIONS]
+        total_logp = batched_hyps.scores.unsqueeze(-1) + combined_logp          # [ BATCH * BEAM, BEAM*DURATIONS]
+        
         if is_first_expansion:
-            # Compute total scores and reshape
-            total_scores = (label_logp[:, :, None] + duration_logp[:, None, :]).reshape(scores.shape[0], -1)
-
-            # Get top-k total scores and their indices
-            topk_total_score, topk_total_score_idx = total_scores.topk(self.beam_size, dim=-1)
-            topk_total_score, topk_total_score_idx = topk_total_score[::self.beam_size].flatten(), topk_total_score_idx[::self.beam_size].flatten()
+            total_logp, total_logp_idx = total_logp.topk(self.beam_size, dim=-1)
+            total_logp, total_logp_idx = total_logp[::self.beam_size].flatten(), total_logp_idx[::self.beam_size].flatten()
             
-            # Extract labels and durations using top-k indices
-            labels = labels[torch.arange(labels.shape[0]), topk_total_score_idx // all_durations.shape[0]]
-            durations = all_durations[topk_total_score_idx % all_durations.shape[0]]
-            batch_idx = torch.repeat(torch.arange(self.beam_size))
+            beam_idx = torch.arange(self.beam_size, device=total_logp.device).repeat(batched_hyps.batch_size).unsqueeze(0)
+            label_idx = total_logp_idx // all_durations.shape[0]
+            duration_idx = total_logp_idx % all_durations.shape[0]
         else:
-            # Compute total scores and reshape
-            logp = (label_logp[:, :, None] + duration_logp[:, None, :])         # Batch*Beam x Beam x Durations
-            total_logp = (logp.flatten() + batched_hyps.scores).view(logp.shape[0], -1)      # Batch*Beam x Beam*Durations
+            total_logp = total_logp.view(batched_hyps.batch_size, -1)               # [ BATCH, BEAM*BEAM*DURATIONS]
+            total_logp, total_logp_idx = total_logp.topk(self.beam_size, dim=-1)    # [ BATCH, BEAM]
             
-            logp = logp.reshape(scores.shape[0] // self.beam_size, -1)
-            total_logp = total_logp.reshape(scores.shape[0] // self.beam_size, -1) # Batch x Beam*Beam*Durations
-            _, topk_idx = total_logp.topk(self.beam_size, dim=-1)
-            topk_total_score = torch.gather(logp, index=topk_idx, dim=1)
+            beam_idx = total_logp_idx // (duration_logp.shape[0] * self.beam_size)
+            label_idx = total_logp_idx // all_durations.shape[0] % self.beam_size
+            duration_idx = total_logp_idx % duration_logp.shape[0]
             
-            topk_total_score, topk_total_score_idx = topk_total_score.flatten(), topk_idx.flatten()
-
-            # Extract labels and durations using top-k indices
-            batch_idx = topk_total_score_idx // all_durations.shape[0] // self.beam_size
-            labels = labels[torch.arange(labels.shape[0]), topk_total_score_idx // all_durations.shape[0] % self.beam_size]
-            durations = all_durations[topk_total_score_idx % all_durations.shape[0]]
+        logps = label_logp[torch.arange(labels.shape[0]), label_idx].squeeze()
+        labels = labels[torch.arange(labels.shape[0]), label_idx].squeeze()
+        durations = all_durations[duration_idx].squeeze()
         
-        return labels, durations, batch_idx, topk_total_score
+        return labels, durations, beam_idx, logps
+    
+    # def _get_label_expansions(self, batched_hyps: rnnt_utils.BatchedBeamHyps, logits: torch.Tensor, all_durations: torch.Tensor, is_first_expansion: bool):
+    #     num_durations = all_durations.shape[0]
+    #     # Get top-k label and duration scores
+    #     scores, labels = logits[:, :-num_durations].topk(self.beam_size)
+    #     duration_scores = logits[:, -num_durations:]
+        
+    #     # Compute log probabilities for labels and durations
+    #     label_logp = torch.log_softmax(scores, dim=-1)
+    #     duration_logp = torch.log_softmax(duration_scores, dim=-1)
+
+    #     batch_size = int(labels.shape[0] / self.beam_size)
+    #     # is_first_expansion = False
+    #     if is_first_expansion:
+    #         # Compute total scores and reshape
+    #         total_scores = (label_logp[:, :, None] + duration_logp[:, None, :]).reshape(scores.shape[0], -1)
+
+    #         # Get top-k total scores and their indices
+    #         topk_total_score, topk_total_score_idx = total_scores.topk(self.beam_size, dim=-1)
+    #         topk_total_score, topk_total_score_idx = topk_total_score[::self.beam_size].flatten(), topk_total_score_idx[::self.beam_size].flatten()
+            
+    #         # Extract labels and durations using top-k indices
+    #         labels = labels[torch.arange(labels.shape[0]), topk_total_score_idx // all_durations.shape[0]]
+    #         durations = all_durations[topk_total_score_idx % all_durations.shape[0]]
+    #         batch_idx = torch.arange(self.beam_size).repeat(batch_size)
+    #     else:
+    #         # Compute total scores and reshape
+    #         logp = (label_logp[:, :, None] + duration_logp[:, None, :])         # Batch*Beam x Beam x Durations
+    #         total_logp = (logp.view(batch_size*self.beam_size, -1) + batched_hyps.scores.unsqueeze(-1)).view(logp.shape[0], -1)      # Batch*Beam x Beam*Durations
+            
+    #         logp = logp.reshape(scores.shape[0] // self.beam_size, -1)
+    #         total_logp = total_logp.reshape(scores.shape[0] // self.beam_size, -1) # Batch x Beam*Beam*Durations
+    #         _, topk_idx = total_logp.topk(self.beam_size, dim=-1)
+    #         topk_total_score = torch.gather(logp, index=topk_idx, dim=1)
+            
+    #         topk_total_score, topk_total_score_idx = topk_total_score.flatten(), topk_idx.flatten()
+
+    #         # Extract labels and durations using top-k indices
+    #         batch_idx = topk_total_score_idx // all_durations.shape[0] // self.beam_size
+    #         labels = labels[torch.arange(labels.shape[0]), topk_total_score_idx // all_durations.shape[0] % self.beam_size]
+    #         durations = all_durations[topk_total_score_idx % all_durations.shape[0]]
+        
+    #     return labels, durations, batch_idx, topk_total_score
 
 
     def _before_outer_loop(self):
