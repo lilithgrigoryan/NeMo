@@ -228,6 +228,8 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         self.separate_graphs = None
         
         self.beam_size = beam_size
+        
+        self.max_steps = 2
 
     def loop_labels_torch(
         self,
@@ -308,7 +310,12 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
             label_logp = torch.log_softmax(label_logits, dim=-1)
             duration_logp = torch.log_softmax(duration_logits, dim=-1)
             
-            labels, durations, beam_idx, scores = self._get_label_expansions(batched_hyps, label_logp, duration_logp, all_durations, is_first_label)
+            labels, durations, beam_idx, scores = self._get_label_expansions(batched_hyps,
+                                                                             label_logp,
+                                                                             duration_logp,
+                                                                             all_durations,
+                                                                             batched_hyps.scores,
+                                                                             is_first_label)
 
             self.decoder.batch_rearrange_states(src_states=state, indices=beam_idx)
             
@@ -339,12 +346,20 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     .squeeze(1)
                     .squeeze(1)
                 )
+                label_logits = logits[:, :-num_durations]
+                duration_logits = logits[:, -num_durations:]
+                
+                # Compute log probabilities for labels and durations
+                label_logp = torch.log_softmax(label_logits, dim=-1)
+                duration_logp = torch.log_softmax(duration_logits, dim=-1)
+            
                 # get labels (greedy) and scores from current logits, replace labels/scores with new
                 # labels[advance_mask] are blank, and we are looking for non-blank labels
                 more_labels, durations, more_batch_idx, more_scores = self._get_label_expansions(batched_hyps,
-                                                                                                 logits[:, :-num_durations],
-                                                                                                 logits[:, -num_durations:],
+                                                                                                 label_logp,
+                                                                                                 duration_logp,
                                                                                                  all_durations,
+                                                                                                 scores,
                                                                                                  is_first_expansion=False)
 
                 self.decoder.batch_rearrange_states(src_states=state, indices=more_batch_idx)
@@ -420,15 +435,17 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                               label_logp: torch.Tensor,
                               duration_logp: torch.Tensor,
                               all_durations: torch.Tensor,
+                              curr_scores: torch.Tensor,
                               is_first_expansion: bool):
         label_logp, labels = label_logp.topk(self.beam_size, dim=-1)            # [ BATCH * BEAM, BEAM]
         combined_logp = label_logp[:, :, None] + duration_logp[:, None, :]      # [ BATCH * BEAM, BEAM, DURATIONS]
         combined_logp = combined_logp.view(combined_logp.shape[0], -1)          # [ BATCH * BEAM, BEAM*DURATIONS]
-        total_logp = batched_hyps.scores.unsqueeze(-1) + combined_logp          # [ BATCH * BEAM, BEAM*DURATIONS]
+        total_logp = curr_scores.unsqueeze(-1) + combined_logp          # [ BATCH * BEAM, BEAM*DURATIONS]
         
         if is_first_expansion:
             total_logp, total_logp_idx = total_logp.topk(self.beam_size, dim=-1)
             total_logp, total_logp_idx = total_logp[::self.beam_size].flatten(), total_logp_idx[::self.beam_size].flatten()
+            combined_logp = combined_logp.view(combined_logp.shape[0], -1)
             
             beam_idx = torch.arange(self.beam_size, device=total_logp.device).repeat(batched_hyps.batch_size).unsqueeze(0)
             label_idx = total_logp_idx // all_durations.shape[0]
@@ -440,12 +457,16 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
             beam_idx = total_logp_idx // (duration_logp.shape[0] * self.beam_size)
             label_idx = total_logp_idx // all_durations.shape[0] % self.beam_size
             duration_idx = total_logp_idx % duration_logp.shape[0]
-            
-        logps = label_logp[torch.arange(labels.shape[0]), label_idx].squeeze()
-        labels = labels[torch.arange(labels.shape[0]), label_idx].squeeze()
-        durations = all_durations[duration_idx].squeeze()
         
-        return labels, durations, beam_idx, logps
+        beam_idx = beam_idx.flatten()
+        label_idx = label_idx.flatten()
+        duration_idx = duration_idx.flatten()
+
+        logps = combined_logp[torch.arange(labels.shape[0]), label_idx * all_durations.shape[0] + duration_idx]
+        labels = labels[torch.arange(labels.shape[0]), label_idx]
+        durations = all_durations[duration_idx]
+        
+        return labels, durations, beam_idx, logps, is_active
     
     # def _get_label_expansions(self, batched_hyps: rnnt_utils.BatchedBeamHyps, logits: torch.Tensor, all_durations: torch.Tensor, is_first_expansion: bool):
     #     num_durations = all_durations.shape[0]

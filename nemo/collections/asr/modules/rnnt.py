@@ -1087,8 +1087,7 @@ class RNNTDecoder(rnnt_abstract.AbstractRNNTDecoder, Exportable, AdapterModuleMi
         # we need to cast, since LSTM is calculated in fp16 even if autocast to bfloat16 is enabled
         dtype = src_states[0].dtype
         indices = indices.squeeze()
-        torch.index_select(src_states[0].to(dtype), dim=1, index=indices)
-        torch.index_select(src_states[1].to(dtype), dim=1, index=indices)
+        return (torch.index_select(src_states[0].to(dtype), dim=1, index=indices), torch.index_select(src_states[1].to(dtype), dim=1, index=indices))
         
     @classmethod
     def batch_replace_states_all(

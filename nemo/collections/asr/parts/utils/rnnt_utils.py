@@ -527,7 +527,6 @@ class BatchedBeamHyps:
         """
         if (self.current_lengths + active_mask).max() >= self._max_length:
             self._allocate_more()
-        self.transcript = self.transcript.view(self.batch_size, self.beam_size)
         
         self.add_results_masked_no_checks_(
             active_mask=active_mask, labels=labels, time_indices=time_indices, scores=scores
@@ -547,8 +546,19 @@ class BatchedBeamHyps:
             time_indices: tensor of time index for each label
             scores: label scores
         """
+        print(self.transcript.shape)
+        print(self.timesteps.shape)
+        print(self.current_lengths.shape)
+        print(self.scores.shape)
+        self.transcript = self.transcript.index_select(dim=0, index=batch_idx.squeeze()).view(self.batch_size*self.beam_size, -1)
+        self.timesteps = self.timesteps.index_select(dim=0, index=batch_idx.squeeze()).view(self.batch_size*self.beam_size, -1)
+        self.current_lengths = self.current_lengths.index_select(dim=0, index=batch_idx.squeeze()).squeeze()
+        self.scores = self.scores.index_select(dim=0, index=batch_idx.squeeze()).squeeze()
+        
         # accumulate scores
         # same as self.scores[active_mask] += scores[active_mask], but non-blocking
+        print(self.scores.shape)
+        print(scores.shape)
         torch.where(active_mask, self.scores + scores, self.scores, out=self.scores)
 
         # store transcript and timesteps
