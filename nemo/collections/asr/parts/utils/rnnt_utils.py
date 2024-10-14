@@ -399,6 +399,9 @@ class BatchedHyps:
         # increase lengths
         self.current_lengths += active_mask
 
+    def print(self):
+        torch.set_printoptions(profile="full")
+        print(f" Score: {self.scores}, Labels: {self.transcript[:self.last_timestep[-1].item()+1]}")
 
 class BatchedBeamHyps:
     """Class to store batched hypotheses (labels, time_indices, scores) for efficient RNNT decoding"""

@@ -260,6 +260,8 @@ class GreedyBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMetho
             return
 
         if not self.allow_cuda_graphs:
+            print("#"*100)
+            print(self.allow_cuda_graphs)
             self.cuda_graphs_mode = None
         else:
             # cuda graphs are allowed
@@ -437,6 +439,7 @@ class GreedyBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMetho
 
             # inner loop: find next non-blank labels (if exist)
             while advance_mask.any():
+                batched_hyps.print()
                 # same as: time_indices_current_labels[advance_mask] = time_indices[advance_mask], but non-blocking
                 # store current time indices to use further for storing the results
                 torch.where(advance_mask, time_indices, time_indices_current_labels, out=time_indices_current_labels)

@@ -229,7 +229,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         
         self.beam_size = beam_size
         
-        self.max_steps = 2
+        self.max_steps = 4
 
     def loop_labels_torch(
         self,
@@ -244,6 +244,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
             encoder_output_length: lengths of the utterances in `encoder_output`
         """
         batch_size, max_time, _unused = encoder_output.shape
+        beam_size = self.beam_size
         device = encoder_output.device
 
         encoder_output = encoder_output.repeat_interleave(self.beam_size, dim=0)
@@ -276,158 +277,196 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         labels = torch.full((batch_size * self.beam_size,), fill_value=self._SOS)
 
         # time indices
-        time_indices = torch.zeros_like(labels, device=device)
-        safe_time_indices = torch.zeros_like(labels, device=device)  # time indices, guaranteed to be < out_len
-        time_indices_current_labels = torch.zeros_like(labels, device=device)
+        time_indices = torch.zeros((batch_size * self.beam_size, ), device=device, dtype=torch.long)
+        safe_time_indices = torch.zeros_like(time_indices, device=device, dtype=torch.long)  # time indices, guaranteed to be < out_len
+        time_indices_current_labels = torch.zeros_like(time_indices, device=device, dtype=torch.long)
         last_timesteps = (encoder_output_length - 1)
 
         # masks for utterances in batch
         active_samples_mask: torch.Tensor = encoder_output_length > 0
-        advance_mask = torch.empty_like(active_samples_mask)
+        inner_activate_samples_mask = torch.empty_like(active_samples_mask)
+        # advance_mask = torch.empty_like(active_samples_mask)
 
-        # for storing the last state we need to know what elements became "inactive" on this step
-        active_mask_prev = torch.empty_like(active_samples_mask)
-        became_inactive_mask = torch.empty_like(active_samples_mask)
+        # # for storing the last state we need to know what elements became "inactive" on this step
+        # active_mask_prev = torch.empty_like(active_samples_mask)
+        # became_inactive_mask = torch.empty_like(active_samples_mask)
 
         is_first_label = True
         # loop while there are active utterances
-        while active_samples_mask.any():
+        iter_count = 0
+        while active_samples_mask.any() and iter_count <= 10:
+            iter_count += 1
+            expansion_labels = [torch.empty((batch_size * self.beam_size, self.beam_size), device=device, dtype=torch.long) for _ in range(self.max_steps)]
+            expansion_durations = [torch.empty((batch_size * self.beam_size, self.beam_size), device=device, dtype=torch.long) for _ in range(self.max_steps)]
+            expansion_logps = [torch.empty((batch_size * self.beam_size, self.beam_size), device=device, dtype=float_dtype) for _ in range(self.max_steps)]
+            expansion_blank_durations = [torch.zeros((batch_size * self.beam_size, self.beam_size), device=device, dtype=torch.long) for _ in range(self.max_steps)]
+            expansion_blank_logps = [torch.zeros((batch_size * self.beam_size, self.beam_size), device=device, dtype=float_dtype) for _ in range(self.max_steps)]
+        
             batched_hyps.print()
-            active_mask_prev.copy_(active_samples_mask, non_blocking=True)
+            # active_mask_prev.copy_(active_samples_mask, non_blocking=True)
             # stage 1: get decoder (prediction network) output
             decoder_output, state, *_ = self.decoder.predict(
                 labels.unsqueeze(1), state, add_sos=False, batch_size=batch_size
             )
             decoder_output = self.joint.project_prednet(decoder_output)  # do not recalculate joint projection
 
-            # stage 2: get joint output, iteratively seeking for non-blank labels
-            # blank label in `labels` tensor means "end of hypothesis" (for this index)
-            logits = self.joint.joint_after_projection(encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),decoder_output).squeeze(1).squeeze(1)
-            label_logits = logits[:, :-num_durations]
-            duration_logits = logits[:, -num_durations:]
-            
-            # Compute log probabilities for labels and durations
-            label_logp = torch.log_softmax(label_logits, dim=-1)
-            duration_logp = torch.log_softmax(duration_logits, dim=-1)
-            
-            labels, durations, beam_idx, scores = self._get_label_expansions(batched_hyps,
-                                                                             label_logp,
-                                                                             duration_logp,
-                                                                             all_durations,
-                                                                             batched_hyps.scores,
-                                                                             is_first_label)
-
-            self.decoder.batch_rearrange_states(src_states=state, indices=beam_idx)
-            
-            # search for non-blank labels using joint, advancing time indices for blank labels
-            # checking max_symbols is not needed, since we already forced advancing time indices for such cases
-            blank_mask = labels == self._blank_index
-            # for blank labels force duration >= 1
-            durations.masked_fill_(torch.logical_and(durations == 0, blank_mask), 1)
-            time_indices_current_labels.copy_(time_indices, non_blocking=True)
-
-            # advance_mask is a mask for current batch for searching non-blank labels;
-            # each element is True if non-blank symbol is not yet found AND we can increase the time index
-            time_indices += durations
-            torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
-            torch.less(time_indices, encoder_output_length, out=active_samples_mask)
-            torch.logical_and(active_samples_mask, blank_mask, out=advance_mask)
-
-            # inner loop: find next non-blank labels (if exist)
-            while advance_mask.any():
-                # same as: time_indices_current_labels[advance_mask] = time_indices[advance_mask], but non-blocking
-                # store current time indices to use further for storing the results
-                torch.where(advance_mask, time_indices, time_indices_current_labels, out=time_indices_current_labels)
-                logits = (
-                    self.joint.joint_after_projection(
-                        encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
-                        decoder_output,
-                    )
-                    .squeeze(1)
-                    .squeeze(1)
-                )
+            blank_loop = 0
+            while blank_loop < self.max_steps and inner_activate_samples_mask.any():
+                assert((safe_time_indices <= last_timesteps).all())
+                time_indices_current_labels.copy_(time_indices, non_blocking=True)
+                # stage 2: get joint output, iteratively seeking for non-blank labels
+                # blank label in `labels` tensor means "end of hypothesis" (for this index)
+                logits = self.joint.joint_after_projection(
+                    encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
+                    decoder_output).squeeze()
                 label_logits = logits[:, :-num_durations]
                 duration_logits = logits[:, -num_durations:]
                 
                 # Compute log probabilities for labels and durations
-                label_logp = torch.log_softmax(label_logits, dim=-1)
-                duration_logp = torch.log_softmax(duration_logits, dim=-1)
+                label_logp = torch.log_softmax(label_logits, dim=-1)                # [BATCH*BEAM, V+1]
+                duration_logp = torch.log_softmax(duration_logits, dim=-1)          # [BATCH*BEAM, DURATIONS]
+                blank_logps = label_logp[:, self._blank_index]
+                
+                # non-blank expansions
+                # TODO leave topk labels
+                combined_logp = label_logp[:, :-1, None] + duration_logp[:, None, :]    # [BATCH*BEAM, V, DURATIONS]
+                combined_logp =  combined_logp.view(batch_size*beam_size, -1)           # [BATCH*BEAM, V * DURATIONS]
+                
+                if is_first_label:
+                    # before first decoding step all the hypothesis in a beam are identical
+                    # keeping just first hyp in a beam
+                    combined_logp = combined_logp[::self.beam_size]                 # [BATCH, V * DURATIONS]
+                    
+                    # getting first BEAM combined logp label and duration pairs
+                    # indices are in flattened [V+1, DURATIONS] arrays
+                    flat_logp, flat_idx = combined_logp.topk(beam_size, dim = -1)   # [BATCH, BEAM]
+                    logps, flat_idx = flat_logp.view(-1, 1), flat_idx.view(-1, 1)   # [BATCH*BEAM]
+                    
+                    # restoring durations and labels
+                    durations = all_durations[flat_idx % num_durations]             # [BATCH*BEAM]
+                    labels = flat_idx // num_durations                              # [BATCH*BEAM]
+                    
+                    blank_logps = blank_logps[::self.beam_size].flatten()
+                    
+                    blank_duration_logps, blank_duration_idx = duration_logp[::self.beam_size].topk(beam_size, dim=-1)
+                    blank_duration_logps, blank_duration_idx = blank_logps.flatten(), blank_duration_idx.flatten()
+                    blank_durations = all_durations[blank_duration_idx]
+                    
+                    assert((blank_duration_idx <= 4).all())
+                    assert((labels <= 1023).all())
+                    
+                    assert(durations.shape == torch.Size([batch_size*beam_size, 1]))
+                    assert(labels.shape == torch.Size([batch_size*beam_size, 1]))
+                    assert(logps.shape == torch.Size([batch_size*beam_size, 1]))
+                    
+                    is_first_label = False
+                else:
+                    logps, flat_idx = combined_logp.topk(beam_size, dim = -1)           # [BATCH*BEAM, BEAM]
+                    
+                    # restoring durations and labels
+                    durations = all_durations[flat_idx % num_durations]                 # [BATCH*BEAM, BEAM]
+                    labels = flat_idx // num_durations                                  # [BATCH*BEAM, BEAM]
+                    
+                    blank_duration_logps, blank_duration_idx = duration_logp.max(dim=-1)
+                    blank_durations = all_durations[blank_duration_idx]
+                    
+                    assert((flat_idx % num_durations <= 4).all())
+                    assert((labels <= 1023).all())
+                    
+                    assert(durations.shape == torch.Size([batch_size*beam_size, beam_size]))
+                    assert(labels.shape == torch.Size([batch_size*beam_size, beam_size]))
+                    assert(logps.shape == torch.Size([batch_size*beam_size, beam_size]))
+                
+                expansion_labels[blank_loop] = labels
+                expansion_durations[blank_loop] = durations if blank_loop == 0 else expansion_blank_durations[blank_loop - 1] + durations
+                expansion_logps[blank_loop] = logps if blank_loop == 0 else expansion_blank_logps[blank_loop - 1] + logps
+                
+                expansion_blank_logps[blank_loop] = blank_logps + blank_duration_logps if blank_loop == 0 else expansion_blank_logps[blank_loop-1] + blank_logps + blank_duration_logps
+                expansion_blank_durations[blank_loop] = all_durations[blank_duration_idx] if blank_loop == 0 else expansion_blank_durations[blank_loop-1] + blank_durations
+                
+                time_indices_current_labels += blank_durations
+                torch.minimum(time_indices_current_labels, last_timesteps, out=safe_time_indices)
+                torch.less(time_indices_current_labels, encoder_output_length, out=inner_activate_samples_mask)
+
+                blank_loop += 1
             
-                # get labels (greedy) and scores from current logits, replace labels/scores with new
-                # labels[advance_mask] are blank, and we are looking for non-blank labels
-                more_labels, durations, more_batch_idx, more_scores = self._get_label_expansions(batched_hyps,
-                                                                                                 label_logp,
-                                                                                                 duration_logp,
-                                                                                                 all_durations,
-                                                                                                 scores,
-                                                                                                 is_first_expansion=False)
-
-                self.decoder.batch_rearrange_states(src_states=state, indices=more_batch_idx)
-                # same as: labels[advance_mask] = more_labels[advance_mask], but non-blocking
-                torch.where(advance_mask, more_labels, labels, out=labels)
-                # same as: scores[advance_mask] = more_scores[advance_mask], but non-blocking
-                torch.where(advance_mask, scores + more_scores, scores, out=scores)
-
-                blank_mask = labels == self._blank_index
-                # for blank labels force duration >= 1
-                durations.masked_fill_(torch.logical_and(durations == 0, blank_mask), 1)
-                # same as time_indices[advance_mask] += durations[advance_mask], but non-blocking
-                torch.where(advance_mask, time_indices + durations, time_indices, out=time_indices)
-                torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
-                torch.less(time_indices, encoder_output_length, out=active_samples_mask)
-                torch.logical_and(active_samples_mask, blank_mask, out=advance_mask)
-
-            is_first_label = False
+            expansion_logps = torch.cat(expansion_logps, dim=1)
+            expansion_durations = torch.cat(expansion_durations, dim=1)
+            expansion_labels = torch.cat(expansion_labels, dim=1)
             
-            # stage 3: filter labels and state, store hypotheses
-            # select states for hyps that became inactive (is it necessary?)
-            # this seems to be redundant, but used in the `loop_frames` output
-            torch.ne(active_samples_mask, active_mask_prev, out=became_inactive_mask)
-            self.decoder.batch_replace_states_mask(
-                src_states=state,
-                dst_states=last_decoder_state,
-                mask=became_inactive_mask,
-            )
+            num_expansions = expansion_logps.shape[1]
+            _, expansion_idx = expansion_logps.view(batch_size, -1).topk(beam_size, -1)
+            beam_idx = expansion_idx // num_expansions
+            expansion_idx = expansion_idx % num_expansions
+            
+            expansion_logps = expansion_logps.view(batch_size, beam_size, -1)
+            expansion_durations = expansion_durations.view(batch_size, beam_size, -1)
+            expansion_labels = expansion_labels.view(batch_size, beam_size, -1)
+            
+            assert((beam_idx<=4).all())
+            assert((expansion_idx<=16).all())
+            assert((beam_idx<=expansion_logps.shape[1]).all())
+            assert((expansion_idx<=expansion_logps.shape[2]).all())
+            logps = expansion_logps[torch.arange(batch_size, dtype=torch.long, device=device), beam_idx, expansion_idx].flatten()
+            durations = expansion_durations[torch.arange(batch_size, dtype=torch.long, device=device), beam_idx, expansion_idx].flatten()
+            labels = expansion_labels[torch.arange(batch_size, dtype=torch.long, device=device), beam_idx, expansion_idx].flatten()
+            
+            print(labels)
+            print(durations)
+            
+            time_indices += durations
+            torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
+            torch.less(time_indices, encoder_output_length, out=active_samples_mask)
+            
+            # # stage 3: filter labels and state, store hypotheses
+            # # select states for hyps that became inactive (is it necessary?)
+            # # this seems to be redundant, but used in the `loop_frames` output
+            # torch.ne(active_samples_mask, active_mask_prev, out=became_inactive_mask)
+            # self.decoder.batch_replace_states_mask(
+            #     src_states=state,
+            #     dst_states=last_decoder_state,
+            #     mask=became_inactive_mask,
+            # )
 
-            # store hypotheses
-            if self.max_symbols is not None:
-                # pre-allocated memory, no need for checks
-                batched_hyps.add_results_masked_no_checks_(
-                    active_samples_mask,
-                    labels,
-                    time_indices_current_labels,
-                    scores,
-                    batch_idx=more_batch_idx
-                )
-            else:
-                # auto-adjusted storage
-                batched_hyps.add_results_masked_(
-                    active_samples_mask,
-                    labels,
-                    time_indices_current_labels,
-                    scores,
-                    batch_idx=more_batch_idx
-                )
+            # # store hypotheses
+            # if self.max_symbols is not None:
+            #     # pre-allocated memory, no need for checks
+            #     batched_hyps.add_results_masked_no_checks_(
+            #         active_samples_mask,
+            #         labels,
+            #         time_indices_current_labels,
+            #         scores,
+            #         batch_idx=more_batch_idx
+            #     )
+            # else:
+            #     # auto-adjusted storage
+            #     batched_hyps.add_results_masked_(
+            #         active_samples_mask,
+            #         labels,
+            #         time_indices_current_labels,
+            #         scores,
+            #         batch_idx=more_batch_idx
+            #     )
 
-            # stage 4: to avoid looping, go to next frame after max_symbols emission
-            if self.max_symbols is not None:
-                # if labels are non-blank (not end-of-utterance), check that last observed timestep with label:
-                # if it is equal to the current time index, and number of observations is >= max_symbols, force blank
-                force_blank_mask = torch.logical_and(
-                    active_samples_mask,
-                    torch.logical_and(
-                        torch.logical_and(
-                            labels != self._blank_index,
-                            batched_hyps.last_timestep_lasts >= self.max_symbols,
-                        ),
-                        batched_hyps.last_timestep == time_indices,
-                    ),
-                )
-                time_indices += force_blank_mask  # emit blank => advance time indices
-                # update safe_time_indices, non-blocking
-                torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
-                # same as: active_mask = time_indices < encoder_output_length
-                torch.less(time_indices, encoder_output_length, out=active_samples_mask)
+            # # stage 4: to avoid looping, go to next frame after max_symbols emission
+            # if self.max_symbols is not None:
+            #     # if labels are non-blank (not end-of-utterance), check that last observed timestep with label:
+            #     # if it is equal to the current time index, and number of observations is >= max_symbols, force blank
+            #     force_blank_mask = torch.logical_and(
+            #         active_samples_mask,
+            #         torch.logical_and(
+            #             torch.logical_and(
+            #                 labels != self._blank_index,
+            #                 batched_hyps.last_timestep_lasts >= self.max_symbols,
+            #             ),
+            #             batched_hyps.last_timestep == time_indices,
+            #         ),
+            #     )
+            #     time_indices += force_blank_mask  # emit blank => advance time indices
+            #     # update safe_time_indices, non-blocking
+            #     torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
+            #     # same as: active_mask = time_indices < encoder_output_length
+            #     torch.less(time_indices, encoder_output_length, out=active_samples_mask)
         return batched_hyps, None, last_decoder_state
 
     def _get_label_expansions(self,
