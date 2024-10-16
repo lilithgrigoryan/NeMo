@@ -401,7 +401,9 @@ class BatchedHyps:
 
     def print(self):
         torch.set_printoptions(profile="full")
-        print(f" Score: {self.scores}, Labels: {self.transcript[:self.last_timestep[-1].item()+1]}")
+        print(f"Score: {self.scores}")
+        print(f"Labels: {self.transcript[:self.last_timestep[-1].item()+1]},")
+        print(f"Length: {self.timesteps}")
 
 class BatchedBeamHyps:
     """Class to store batched hypotheses (labels, time_indices, scores) for efficient RNNT decoding"""
@@ -536,7 +538,12 @@ class BatchedBeamHyps:
         )
 
     def add_results_masked_no_checks_(
-        self, active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor, batch_idx: torch.Tensor
+        self,
+        active_mask: torch.Tensor,
+        labels: torch.Tensor,
+        time_indices: torch.Tensor,
+        scores: torch.Tensor, 
+        batch_idx: torch.Tensor
     ):
         """
         Add results (inplace) from a decoding step to the batched hypotheses without checks.
@@ -549,19 +556,14 @@ class BatchedBeamHyps:
             time_indices: tensor of time index for each label
             scores: label scores
         """
-        print(self.transcript.shape)
-        print(self.timesteps.shape)
-        print(self.current_lengths.shape)
-        print(self.scores.shape)
-        self.transcript = self.transcript.index_select(dim=0, index=batch_idx.squeeze()).view(self.batch_size*self.beam_size, -1)
-        self.timesteps = self.timesteps.index_select(dim=0, index=batch_idx.squeeze()).view(self.batch_size*self.beam_size, -1)
-        self.current_lengths = self.current_lengths.index_select(dim=0, index=batch_idx.squeeze()).squeeze()
-        self.scores = self.scores.index_select(dim=0, index=batch_idx.squeeze()).squeeze()
+        batch_idx = batch_idx.flatten()
+        self.transcript = self.transcript.index_select(dim=0, index=batch_idx).view(self.batch_size*self.beam_size, -1)
+        self.timesteps = self.timesteps.index_select(dim=0, index=batch_idx).view(self.batch_size*self.beam_size, -1)
+        self.current_lengths = self.current_lengths.index_select(dim=0, index=batch_idx).squeeze()
+        self.scores = self.scores.index_select(dim=0, index=batch_idx).squeeze()
         
         # accumulate scores
         # same as self.scores[active_mask] += scores[active_mask], but non-blocking
-        print(self.scores.shape)
-        print(scores.shape)
         torch.where(active_mask, self.scores + scores, self.scores, out=self.scores)
 
         # store transcript and timesteps
@@ -587,27 +589,32 @@ class BatchedBeamHyps:
         self.current_lengths += active_mask
         
     def get_best_hypotheses(self) -> List[Hypothesis]:
-        num_hyps = self.scores.shape[0] / self.beam_size if self.beam_size is None else self.batch_size
+        self.print()
         hypotheses = []
-        for i in range(num_hyps):
+        for batch_idx in range(self.batch_size):
             beam = [Hypothesis(
                 score=self.scores[beam_idx].item(),
                 y_sequence=self.transcript[beam_idx, : self.current_lengths[beam_idx]],
                 timestep=self.timesteps[beam_idx, : self.current_lengths[beam_idx]],
                 alignments=None,
                 dec_state=None,
-            ) for beam_idx in range(i*self.beam_size, (i+1)*self.beam_size)]
+            ) for beam_idx in range(batch_idx*self.beam_size, (batch_idx+1)*self.beam_size)]
             beam = sorted(beam, key= lambda x: x.score, reverse=True)
             hypotheses.append(beam[0])
             
+        print(len(hypotheses))
+        print(hypotheses)
         return hypotheses
         
     def print(self):
         torch.set_printoptions(profile="full")
-        for _ in range(self.batch_size):
-            print(f"Hyp: {_}")
+        for batch_idx in range(self.batch_size):
+            print(f"Hyp: {batch_idx}")
             for idx in range(self.beam_size):
-                print(f"{idx}. Score: {self.scores[idx]}, Labels: {self.transcript[idx][:self.last_timestep[-1].item()+1]}")
+                index = idx + batch_idx * self.beam_size
+                print(f"{idx}. Scores: {self.scores[index]}")
+                print(f"{idx}. Labels: {self.transcript[index][:self.current_lengths[index]+ 1].clone().cpu().numpy()}")
+                print(f"{idx}. Length: {self.timesteps[index][:self.current_lengths[index] + 1].clone().cpu().numpy()}")
 
 
 class BatchedAlignments:

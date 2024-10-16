@@ -127,6 +127,7 @@ def main(cfg: EvaluationConfig):
 
     if not cfg.only_score_manifest:
         # Transcribe speech into an output directory
+
         transcription_cfg = transcribe_speech.main(cfg)  # type: EvaluationConfig
 
         # Release GPU memory if it was used during transcription
