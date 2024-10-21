@@ -402,8 +402,8 @@ class BatchedHyps:
     def print(self):
         torch.set_printoptions(profile="full")
         print(f"Score: {self.scores}")
-        print(f"Labels: {self.transcript[:self.last_timestep[-1].item()+1]},")
-        print(f"Length: {self.timesteps}")
+        print(f"Labels: {self.transcript[:, :self.current_lengths].clone().cpu().numpy()},")
+        print(f"Length: {self.timesteps[:, :self.current_lengths].clone().cpu().numpy()}")
 
 class BatchedBeamHyps:
     """Class to store batched hypotheses (labels, time_indices, scores) for efficient RNNT decoding"""
@@ -561,6 +561,10 @@ class BatchedBeamHyps:
         self.timesteps = self.timesteps.index_select(dim=0, index=batch_idx).view(self.batch_size*self.beam_size, -1)
         self.current_lengths = self.current_lengths.index_select(dim=0, index=batch_idx).squeeze()
         self.scores = self.scores.index_select(dim=0, index=batch_idx).squeeze()
+        
+        if self.scores.dim() == 0:
+            self.current_lengths = self.current_lengths.unsqueeze(0)
+            self.scores = self.scores.unsqueeze(0)
         
         # accumulate scores
         # same as self.scores[active_mask] += scores[active_mask], but non-blocking

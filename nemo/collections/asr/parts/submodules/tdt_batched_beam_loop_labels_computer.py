@@ -229,7 +229,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         
         self.beam_size = beam_size
         
-        self.max_steps = 2
+        self.max_steps = 5
 
     def loop_labels_torch(
         self,
@@ -286,6 +286,8 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         active_samples_mask: torch.Tensor = encoder_output_length > 0
         inner_active_samples_mask = torch.empty_like(active_samples_mask)
         inner_become_inactive_samples_mask = torch.empty_like(active_samples_mask)
+        
+        blanks = torch.full((batch_size * self.beam_size, 1), fill_value=self._blank_index, device=device)
         # advance_mask = torch.empty_like(active_samples_mask)
 
         # # for storing the last state we need to know what elements became "inactive" on this step
@@ -296,14 +298,18 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         # loop while there are active utterances
         iter_count = 0
         while active_samples_mask.any():
+            # batched_hyps.print()
+            time_indices_current_labels = time_indices.clone()
+            # print("Iter count: ", iter_count)
             iter_count += 1
             expansion_labels = []
-            expansion_durations = []
+            expansion_end_durations = []
+            expansion_start_durations = []
+            expansion_total_logps = []
             expansion_logps = []
             expansion_blank_durations = []
             expansion_blank_logps = []
         
-            batched_hyps.print()
             inner_active_samples_mask.copy_(active_samples_mask, non_blocking=True)
             inner_become_inactive_samples_mask.copy_(active_samples_mask, non_blocking=True)
             # active_mask_prev.copy_(active_samples_mask, non_blocking=True)
@@ -315,12 +321,14 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
 
             blank_loop = 0
             while blank_loop < self.max_steps and inner_active_samples_mask.any():
-                time_indices_current_labels.copy_(time_indices, non_blocking=True)
+                # time_indices_current_labels.copy_(time_indices, non_blocking=True)
                 # stage 2: get joint output, iteratively seeking for non-blank labels
                 # blank label in `labels` tensor means "end of hypothesis" (for this index)
                 logits = self.joint.joint_after_projection(
                     encoder_output_projected[batch_indices, safe_time_indices].unsqueeze(1),
                     decoder_output).squeeze()
+                if logits.dim() == 1:
+                    logits = logits.unsqueeze(0)
                 label_logits = logits[:, :-num_durations]
                 duration_logits = logits[:, -num_durations:]
                 
@@ -332,7 +340,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                 # non-blank expansions
                 # TODO leave topk labels
                 combined_logp = label_logp[:, :-1, None] + duration_logp[:, None, :]    # [BATCH*BEAM, V, DURATIONS]
-                combined_logp =  combined_logp.view(batch_size*beam_size, -1)           # [BATCH*BEAM, V * DURATIONS]
+                combined_logp =  combined_logp.view(batch_size * beam_size, -1)           # [BATCH*BEAM, V * DURATIONS]
                 
                 if is_first_label:
                     # before first decoding step all the hypothesis in a beam are identical
@@ -346,7 +354,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     
                     # restoring durations and labels
                     durations = all_durations[flat_idx % num_durations]                 # [BATCH*BEAM]
-                    print("First: ", durations.shape)
+                    # print("First: ", durations.shape)
                     labels = flat_idx // num_durations                                  # [BATCH*BEAM]
                     
                     blank_logps = blank_logps.unsqueeze(1)
@@ -354,9 +362,6 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     blank_duration_logps, blank_duration_idx = duration_logp[::self.beam_size].topk(beam_size, dim=-1)
                     blank_duration_logps, blank_duration_idx = blank_duration_logps.flatten().unsqueeze(1), blank_duration_idx.flatten().unsqueeze(1)
                     blank_durations = all_durations[blank_duration_idx]
-                    print("1. Blank durations shape: ", blank_durations.shape)
-                    print("1. Blank duration logps shape: ", blank_duration_logps.shape)
-                    print("1. Blank logps shape: ", blank_logps.shape)
                     
                     is_first_label = False
                 else:
@@ -364,7 +369,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     
                     # restoring durations and labels
                     durations = all_durations[flat_idx % num_durations]                 # [BATCH*BEAM, BEAM]
-                    print("Second: ", durations.shape)
+                    # print("Second: ", durations.shape)
                     labels = flat_idx // num_durations                                  # [BATCH*BEAM, BEAM]
                     
                     blank_duration_logps, blank_duration_idx = duration_logp.max(dim=-1)
@@ -375,83 +380,107 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
                     blank_duration_logps = blank_duration_logps.unsqueeze(1)
                     blank_durations = blank_durations.unsqueeze(1)
                     
-                    print("2. Blank durations shape: ", blank_durations.shape)
-                    print("2. Blank duration logps shape: ", blank_duration_logps.shape)
-                    print("2. Blank logps shape: ", blank_logps.shape)
-                
-                if blank_loop > 0:
-                    print(expansion_blank_durations[blank_loop - 1].shape)
-                    print(durations.shape)
-                    
-                    print(batched_hyps.scores.unsqueeze(1).shape)
-                    print(expansion_blank_logps[blank_loop - 1].shape)
-                    print(logps.shape)
-                    
+                expansion_end_duration = durations if blank_loop == 0 else expansion_blank_durations[blank_loop - 1] + durations
+                expansion_start_duration = torch.zeros(expansion_end_duration.shape, device=device, dtype=expansion_end_duration.dtype) if blank_loop == 0 else expansion_blank_durations[blank_loop - 1] + torch.zeros(expansion_end_duration.shape, device=device, dtype=expansion_end_duration.dtype)
                 expansion_labels.append(labels)
-                expansion_durations.append(durations if blank_loop == 0 else expansion_blank_durations[blank_loop - 1] + durations)
-                expansion_logps.append(
-                    batched_hyps.scores.unsqueeze(1) + logps if blank_loop == 0 
-                    else batched_hyps.scores.unsqueeze(1) + expansion_blank_logps[blank_loop - 1] + logps)
+                expansion_logps.append(logps if blank_loop == 0 else expansion_blank_logps[blank_loop - 1] + logps)
+                expansion_end_durations.append(expansion_end_duration)
+                expansion_start_durations.append(expansion_start_duration)
+                expansion_total_logps.append(batched_hyps.scores.unsqueeze(1) + logps if blank_loop == 0 else batched_hyps.scores.unsqueeze(1) + expansion_blank_logps[blank_loop - 1] + logps)
                 
                 expansion_blank_logps.append(blank_logps + blank_duration_logps if blank_loop == 0 else expansion_blank_logps[blank_loop-1] + blank_logps + blank_duration_logps)
-                expansion_blank_durations.append(blank_durations if blank_loop == 0 else expansion_blank_durations[blank_loop-1] + blank_durations)
+                expansion_blank_end_duration = blank_durations if blank_loop == 0 else expansion_blank_durations[blank_loop-1] + blank_durations
+                expansion_blank_durations.append(expansion_blank_end_duration)
                 
                 time_indices_current_labels += blank_durations.squeeze()
+                torch.greater_equal(time_indices_current_labels, encoder_output_length, out=inner_become_inactive_samples_mask)
+                inner_become_inactive_samples_mask = torch.logical_and(inner_active_samples_mask, inner_become_inactive_samples_mask)
+                if inner_become_inactive_samples_mask.any():
+                    blank_only_logps = blank_logps if blank_loop == 0 else expansion_blank_logps[blank_loop - 1] + blank_logps
+                    blank_only_logps = torch.where(inner_become_inactive_samples_mask.unsqueeze(1), blank_only_logps, -float('inf')).repeat((1, self.beam_size))
+                    blank_only_total_logps = torch.where(inner_become_inactive_samples_mask.unsqueeze(1), batched_hyps.scores.unsqueeze(1) + blank_only_logps, -float('inf'))
+                    expansion_labels.append(blanks.repeat((1, self.beam_size)))
+                    expansion_logps.append(blank_only_logps)
+                    expansion_total_logps.append(blank_only_total_logps)
+                    expansion_end_durations.append(expansion_blank_end_duration.repeat((1, self.beam_size)))
+                    expansion_start_durations.append(expansion_blank_end_duration.repeat((1, self.beam_size)))
+                
                 torch.minimum(time_indices_current_labels, last_timesteps, out=safe_time_indices)
                 torch.less(time_indices_current_labels, encoder_output_length, out=inner_active_samples_mask)
-
+                
                 blank_loop += 1
 
             expansion_logps = torch.cat(expansion_logps, dim=1)
-            expansion_durations = torch.cat(expansion_durations, dim=1)
             expansion_labels = torch.cat(expansion_labels, dim=1)
+            expansion_start_durations = torch.cat(expansion_start_durations, dim=1)
+            expansion_end_durations = torch.cat(expansion_end_durations, dim=1)
+            expansion_total_logps = torch.cat(expansion_total_logps, dim=1)
+            expansion_blank_durations = torch.cat(expansion_blank_durations, dim=1)
             
             # getting active expansions
-            expanded_durations = expansion_durations + time_indices.unsqueeze(1)
+            expanded_durations = expansion_end_durations + time_indices.unsqueeze(1)
             active_expansions = torch.less(expanded_durations, encoder_output_length.unsqueeze(1))
+
+            # expansion_total_logps = torch.where(active_expansions, expansion_total_logps, -float('inf'))
+            # expansion_logps = torch.where(active_expansions, expansion_logps, -float('inf'))
             
-            expansion_logps = torch.where(active_expansions, expansion_logps, float('inf'))
+            num_expansions = expansion_total_logps.shape[1]
+            _, expansion_idx = expansion_total_logps.view(batch_size, -1).topk(beam_size, -1)
             
-            num_expansions = expansion_logps.shape[1]
-            _, expansion_idx = expansion_logps.view(batch_size, -1).topk(beam_size, -1)
             beam_idx = expansion_idx // num_expansions
             
             active_expansions = active_expansions.view(batch_size, beam_size, -1)
             expansion_logps = expansion_logps.view(batch_size, beam_size, -1)
-            expansion_durations = expansion_durations.view(batch_size, beam_size, -1)
+            expansion_end_durations = expansion_end_durations.view(batch_size, beam_size, -1)
+            expansion_start_durations = expansion_start_durations.view(batch_size, beam_size, -1)
+            expansion_blank_durations = expansion_blank_durations.view(batch_size, beam_size, -1)
             expansion_labels = expansion_labels.view(batch_size, beam_size, -1)
             
-            print("Active expansions: ", active_expansions.shape)
-            print("Batch arange: ", torch.arange(batch_size, dtype=torch.long, device=device).unsqueeze(1))
-            print("Beam idx: ", beam_idx.shape)
-            print("Expansion idx: ", expansion_idx.shape)
+            # print("Active expansions: ", active_expansions.shape)
+            # print("Batch arange: ", torch.arange(batch_size, dtype=torch.long, device=device).unsqueeze(1))
+            # print("Beam idx: ", beam_idx.shape)
+            # print("Expansion idx: ", expansion_idx.shape)
+            # print("Hereee111")
             expansion_idx = expansion_idx % num_expansions
+            # print("Expansion idx: ", expansion_idx)
             batch_indices_2d = torch.arange(batch_size, dtype=torch.long, device=device).unsqueeze(1)
+            # print("Beam idx: ", beam_idx)
             active_expansions = active_expansions[batch_indices_2d, beam_idx, expansion_idx].flatten()
+            # print("active expansios: ", active_expansions)
             logps = expansion_logps[batch_indices_2d, beam_idx, expansion_idx].flatten()
-            durations = expansion_durations[batch_indices_2d, beam_idx, expansion_idx].flatten()
+            # print("logps: ", logps)
+            durations = expansion_end_durations[batch_indices_2d, beam_idx, expansion_idx].flatten()
+            # print("durations: ", durations)
+            start_durations = expansion_start_durations[batch_indices_2d, beam_idx, expansion_idx].flatten()
+            # print("start_durations: ", start_durations)
             labels = expansion_labels[batch_indices_2d, beam_idx, expansion_idx].flatten()
-            beam_idx = beam_idx.flatten() + torch.arange(batch_size, device=device).repeat_interleave(beam_size)
-            print("Beam idx: ", beam_idx)
+            # print("labels: ", labels)
             
-            time_indices += durations.squeeze()
-            torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
-            torch.less(time_indices, encoder_output_length, out=active_samples_mask)
+            # print("Hereee1111")
             
-            # print("Labels", labels.shape, labels)
-            # print("Durations", durations.shape, durations)
-            # print("Time indices", time_indices.shape, time_indices)
-            # print("last_timesteps", last_timesteps.shape, last_timesteps)
+            # print(active_expansions)
+            # print(active_samples_mask)
+            active_expansions = torch.where(active_samples_mask, active_expansions, False)
+            # print(active_expansions)
+            beam_idx = beam_idx.flatten()
+            beam_idx = torch.where(active_samples_mask, beam_idx, 0)
+            beam_idx += torch.arange(batch_size, device=device).repeat_interleave(beam_size)
             
             batched_hyps.add_results_masked_no_checks_(
                 active_expansions,
                 labels,
-                time_indices,
+                time_indices + start_durations,
                 logps,
                 batch_idx=beam_idx
             )
             
+            # print("Hereee11111")
             self.decoder.batch_rearrange_states(state, beam_idx)
+            
+            # print("Time indices: ", time_indices)
+            time_indices += durations.squeeze()
+            torch.minimum(time_indices, last_timesteps, out=safe_time_indices)
+            torch.less(time_indices, encoder_output_length, out=active_samples_mask)
             
             # # stage 3: filter labels and state, store hypotheses
             # # select states for hyps that became inactive (is it necessary?)
@@ -540,7 +569,7 @@ class BeamBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMethodM
         labels = labels[torch.arange(labels.shape[0]), label_idx]
         durations = all_durations[duration_idx]
         
-        return labels, durations, beam_idx, logps, is_active
+        return labels, durations, beam_idx, logps
     
     # def _get_label_expansions(self, batched_hyps: rnnt_utils.BatchedBeamHyps, logits: torch.Tensor, all_durations: torch.Tensor, is_first_expansion: bool):
     #     num_durations = all_durations.shape[0]

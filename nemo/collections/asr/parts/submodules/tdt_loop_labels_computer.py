@@ -374,6 +374,7 @@ class GreedyBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMetho
 
         # loop while there are active utterances
         while active_mask.any():
+            batched_hyps.print()
             active_mask_prev.copy_(active_mask, non_blocking=True)
             # stage 1: get decoder (prediction network) output
             decoder_output, state, *_ = self.decoder.predict(
@@ -391,8 +392,9 @@ class GreedyBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMetho
                 .squeeze(1)
                 .squeeze(1)
             )
-            scores, labels = logits[:, :-num_durations].max(dim=-1)
-            jump_durations_indices = logits[:, -num_durations:].argmax(dim=-1)
+            scores, labels = torch.log_softmax(logits[:, :-num_durations], dim=-1).max(dim=-1)
+            jump_durations_indices = torch.log_softmax(logits[:, -num_durations:], dim=-1).argmax(dim=-1)
+            scores += torch.log_softmax(logits[:, -num_durations:], dim=-1)[batch_indices, jump_durations_indices]
             durations = all_durations[jump_durations_indices]
 
             # search for non-blank labels using joint, advancing time indices for blank labels
@@ -439,7 +441,7 @@ class GreedyBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMetho
 
             # inner loop: find next non-blank labels (if exist)
             while advance_mask.any():
-                batched_hyps.print()
+                # batched_hyps.print()
                 # same as: time_indices_current_labels[advance_mask] = time_indices[advance_mask], but non-blocking
                 # store current time indices to use further for storing the results
                 torch.where(advance_mask, time_indices, time_indices_current_labels, out=time_indices_current_labels)
@@ -453,13 +455,14 @@ class GreedyBatchedTDTLoopLabelsComputer(WithOptionalCudaGraphs, ConfidenceMetho
                 )
                 # get labels (greedy) and scores from current logits, replace labels/scores with new
                 # labels[advance_mask] are blank, and we are looking for non-blank labels
-                more_scores, more_labels = logits[:, :-num_durations].max(dim=-1)
+                more_scores, more_labels = torch.log_softmax(logits[:, :-num_durations], dim=-1).max(dim=-1)
+                jump_durations_indices = torch.log_softmax(logits[:, -num_durations:], dim=-1).argmax(dim=-1)
+                durations = all_durations[jump_durations_indices]
+                more_scores += torch.log_softmax(logits[:, -num_durations:], dim=-1)[batch_indices, jump_durations_indices]
                 # same as: labels[advance_mask] = more_labels[advance_mask], but non-blocking
                 torch.where(advance_mask, more_labels, labels, out=labels)
                 # same as: scores[advance_mask] = more_scores[advance_mask], but non-blocking
                 torch.where(advance_mask, more_scores, scores, out=scores)
-                jump_durations_indices = logits[:, -num_durations:].argmax(dim=-1)
-                durations = all_durations[jump_durations_indices]
 
                 if use_alignments:
                     alignments.add_results_masked_(
