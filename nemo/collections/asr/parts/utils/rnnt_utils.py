@@ -91,6 +91,7 @@ class Hypothesis:
     y_sequence: Union[List[int], torch.Tensor]
     label_score: Optional[float] = None
     blank_score: Optional[float] = None
+    unnormalized_score: Optional[float] = None
     token_scores: Optional[Union[List[float], torch.Tensor]] = None
     text: Optional[str] = None
     dec_out: Optional[List[torch.Tensor]] = None
@@ -679,6 +680,7 @@ class BeamBatchedHyps:
         self.timesteps_end = torch.zeros((batch_size, beam_size, self._max_length), device=device, dtype=torch.long)
         # accumulated scores for hypotheses
         self.scores = torch.zeros((batch_size, beam_size), device=device, dtype=float_dtype)
+        self._unnormalized_score = torch.zeros((batch_size, beam_size), device=device, dtype=float_dtype)
 
         # tracking last timestep of each hyp to avoid infinite looping (when max symbols per frame is restricted)
         # last observed timestep (with label) for each hypothesis
@@ -737,6 +739,8 @@ class BeamBatchedHyps:
                      label_logps: torch.Tensor,
                      blank_logps: torch.Tensor,
                      blank_logps_per_blank: torch.Tensor,
+                     total_logps: torch.Tensor,
+                     unnormalized_total_logps: torch.Tensor,
                      num_blanks: torch.Tensor):
         blank_start_indices = self._full_current_lengths.clone().unsqueeze(-1)
         self.current_lengths = self.current_lengths + 1
@@ -755,18 +759,19 @@ class BeamBatchedHyps:
         
         self.transcripts[self._batch_indices, self._beam_indices, self.current_lengths - 1] = labels
         
-        self._label_scores += label_logps
-        self._blank_scores += blank_logps
+        self._label_scores = label_logps
+        self._blank_scores = blank_logps
         
-        score = self._calculate_score(label_logps, blank_logps) / self._full_current_lengths
-        self.scores += score
+        # score = self._calculate_score(label_logps, blank_logps) / self._full_current_lengths
+        self.scores = total_logps
+        self._unnormalized_score = unnormalized_total_logps
         
         self.timesteps[self._batch_indices, self._beam_indices, self.current_lengths -1] = self.timesteps_end[self._batch_indices, self._beam_indices, self.current_lengths - 2]
         self.timesteps_end[self._batch_indices, self._beam_indices, self.current_lengths -1] = self.timesteps_end[self._batch_indices, self._beam_indices, self.current_lengths - 2] + num_blanks
         
         self._full_transcripts[self._batch_indices, self._beam_indices, self._full_current_lengths - 1] = labels
         self._full_timesteps[self._batch_indices, self._beam_indices, self._full_current_lengths - 1] = self.timesteps_end[self._batch_indices, self._beam_indices, self.current_lengths -1]
-        self._total_scores[self._batch_indices, self._beam_indices, self.current_lengths - 1] = score
+        self._total_scores[self._batch_indices, self._beam_indices, self.current_lengths - 1] = total_logps
         
         # print("Transcript indices shape: ", self._transcript_indices.shape)
         # print("Num blanks shape: ", num_blanks.shape)
@@ -799,11 +804,14 @@ class BeamBatchedHyps:
                      label_logps: torch.Tensor,
                      blank_logps: torch.Tensor,
                      blank_logps_per_blank: torch.Tensor,
+                     total_logps: torch.Tensor,
+                     unnormalized_logps: torch.Tensor,
                      num_blanks: torch.Tensor,
                      beam_idx: torch.Tensor):
         beam_idx_unsqueezed = beam_idx.unsqueeze(-1).expand(-1, -1, self._max_length)
         
         self.scores = self.scores.gather(dim=1, index=beam_idx)
+        self._unnormalized_score = self._unnormalized_score.gather(dim=1, index=beam_idx)
         self.last_timestep = self.last_timestep.gather(dim=1, index=beam_idx)
         self.current_lengths = self.current_lengths.gather(dim=1, index=beam_idx)
         self.last_timestep_repetitions = self.last_timestep_repetitions.gather(dim=1, index=beam_idx)
@@ -819,6 +827,7 @@ class BeamBatchedHyps:
         assert(self._full_transcripts.shape[-1] == self._max_length)
 
         print("Total scores shape: ", self._total_scores.shape)
+        print("Unnormalized Total scores shape: ", self._unnormalized_score.shape)
         self._label_scores = self._label_scores.gather(dim=1, index=beam_idx)
         self._blank_scores = self._blank_scores.gather(dim=1, index=beam_idx)
         self._total_scores = self._total_scores.gather(dim=1, index=beam_idx_unsqueezed)
@@ -830,6 +839,8 @@ class BeamBatchedHyps:
                            label_logps,
                            blank_logps,
                            blank_logps_per_blank.squeeze(-1),
+                           total_logps,
+                           unnormalized_logps,
                            num_blanks)
         
     def add_completed(self,
@@ -839,6 +850,7 @@ class BeamBatchedHyps:
                      num_blanks: torch.Tensor,
                      beam_idx: torch.Tensor,
                      became_inactive_logps: torch.Tensor,
+                     became_inactive_unnormalized_logps: torch.Tensor,
                      became_inactive_logps_per_blank: torch.Tensor):
         for batch_idx in self._batch_indices:
             active_mask = became_inactive_logps[batch_idx, beam_idx[batch_idx]] != float("-inf")
@@ -847,6 +859,9 @@ class BeamBatchedHyps:
                     label = labels[batch_idx, idx]
                     label_logp = label_logps[batch_idx, idx]
                     blank_logp = blank_logps[batch_idx, idx]
+                    print("sss")
+                    unnormalized_total_logp = became_inactive_unnormalized_logps[batch_idx, idx]
+                    print("mmm")
                     
                     num_blank = num_blanks[batch_idx, idx]
                     blank_scores = became_inactive_logps_per_blank[batch_idx, idx, :num_blank]
@@ -855,15 +870,18 @@ class BeamBatchedHyps:
                     full_transcript = torch.cat((self._full_transcripts[batch_idx, idx, :length].flatten(), label), dim=-1)
                     token_scores = torch.cat((self._token_scores[batch_idx, idx, :length].flatten(), blank_scores.flatten(), label_logp))
                     
-                    curr_label_logps = self._label_scores[batch_idx, idx] + label_logp
-                    curr_blank_logps = self._blank_scores[batch_idx, idx] + blank_logp
-                    score = self._calculate_score(curr_label_logps, curr_blank_logps) / length
+                    # curr_label_logps = label_logp
+                    # curr_blank_logps = blank_logp
+                    # score = self._calculate_score(curr_label_logps, curr_blank_logps) / length
+                    
+                    score = unnormalized_total_logp / length
                     
                     self.best_hyps[batch_idx].append(Hypothesis(
                         blank_score=blank_logps,
                         label_score=label_logps,
                         token_scores=token_scores,
                         score=score,
+                        unnormalized_score=unnormalized_total_logp,
                         y_sequence=full_transcript,
                         timestep=self._full_timesteps[batch_idx, idx, :length]
                     ))
@@ -871,7 +889,7 @@ class BeamBatchedHyps:
     def get_best_hyps(self):
         result = []
         for batch_idx in self._batch_indices:
-            sorted_hyps = sorted(self.best_hyps[batch_idx], key=lambda x: x.score, reverse=True)
+            sorted_hyps = sorted(self.best_hyps[batch_idx], key=lambda x: x.unnormalized_score, reverse=True)
             result.append(sorted_hyps[0])
             print("token scores: ", sorted_hyps[0].token_scores)
             print("y sequence: ", sorted_hyps[0].y_sequence)
