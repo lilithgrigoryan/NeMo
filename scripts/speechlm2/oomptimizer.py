@@ -463,7 +463,7 @@ def oomptimizer(
         def __iter__(self):
             gen.reset()
             gen._current = 1
-            yield gen(33, 33)
+            yield gen(100, 100)
             # yield gen(16000, 13)
             gen.reset()
 

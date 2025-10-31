@@ -185,26 +185,31 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
         # Source audio encoding.
         # Input audio: (B, T_samples)
         # Audio embeddings: (B, T, H)
-        encoded, encoded_len = self.perception.forward_encoder(
+        # encoded, encoded_len = self.perception.forward_encoder(
+        #     input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
+        # )
+        # asr_hyps = self.perception.transcribe_encoded(encoded=encoded, encoded_len=encoded_len)
+        # # During training, we randomly drop the transcript
+        # for hyp in asr_hyps:
+        #     if self.training and random.random() < self.cfg.get("asr_transcript_drop_prob", 0.0):
+        #         hyp.text = ""
+        # asr_tokens = [
+        #     torch.as_tensor(self.tokenizer.text_to_ids(f">> {hyp.text} <<" if hyp.text else ">> <<"))
+        #     for hyp in asr_hyps
+        # ]
+        # asr_tokens_len = [at.shape[0] for at in asr_tokens]
+        # asr_tokens = torch.cat(asr_tokens, dim=0).unsqueeze(0).to(self.device)
+        # transcript_embs = torch.split(self.embed_tokens(asr_tokens).squeeze(0), asr_tokens_len, dim=0)
+        # audio_embs, audio_emb_lens = self.perception(encoded=encoded, encoded_len=encoded_len)
+        # audio_embs = [
+        #     torch.cat([aemb[:aemblen], temb], dim=0)
+        #     for aemb, aemblen, temb in zip(audio_embs, audio_emb_lens, transcript_embs)
+        # ]
+
+        audio_embs, audio_emb_lens = self.perception(
             input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
         )
-        asr_hyps = self.perception.transcribe_encoded(encoded=encoded, encoded_len=encoded_len)
-        # During training, we randomly drop the transcript
-        for hyp in asr_hyps:
-            if self.training and random.random() < self.cfg.get("asr_transcript_drop_prob", 0.0):
-                hyp.text = ""
-        asr_tokens = [
-            torch.as_tensor(self.tokenizer.text_to_ids(f">> {hyp.text} <<" if hyp.text else ">> <<"))
-            for hyp in asr_hyps
-        ]
-        asr_tokens_len = [at.shape[0] for at in asr_tokens]
-        asr_tokens = torch.cat(asr_tokens, dim=0).unsqueeze(0).to(self.device)
-        transcript_embs = torch.split(self.embed_tokens(asr_tokens).squeeze(0), asr_tokens_len, dim=0)
-        audio_embs, audio_emb_lens = self.perception(encoded=encoded, encoded_len=encoded_len)
-        audio_embs = [
-            torch.cat([aemb[:aemblen], temb], dim=0)
-            for aemb, aemblen, temb in zip(audio_embs, audio_emb_lens, transcript_embs)
-        ]
+        audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
@@ -493,23 +498,8 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
             token_embeds = self.embed_tokens(tokens_to_embed)
             # TODO: temporary workaround to perform batch_size=1 inference for audio encoder
             #   due to accuracy issues at bs>1
-            #audio_embeds, audio_embed_lens = self.perception(audios, audio_lens)
-            #audio_embeds = [audio_embeds[i, :elen] for i, elen in enumerate(audio_embed_lens)]
-
-            encoded, encoded_len = self.perception.forward_encoder(input_signal=audios, input_signal_length=audio_lens)
-            asr_hyps = self.perception.transcribe_encoded(encoded=encoded, encoded_len=encoded_len)
-            asr_tokens = [
-                torch.as_tensor(self.tokenizer.text_to_ids(f">> {hyp.text} <<" if hyp.text else ">> <<"))
-                for hyp in asr_hyps
-            ]
-            asr_tokens_len = [at.shape[0] for at in asr_tokens]
-            asr_tokens = torch.cat(asr_tokens, dim=0).unsqueeze(0).to(self.device)
-            transcript_embs = torch.split(self.embed_tokens(asr_tokens).squeeze(0), asr_tokens_len, dim=0)
-            audio_embeds, audio_embed_lens = self.perception(encoded=encoded, encoded_len=encoded_len)
-            audio_embeds = [
-                torch.cat([aemb[:aemblen], temb], dim=0)
-                for aemb, aemblen, temb in zip(audio_embeds, audio_embed_lens, transcript_embs)
-            ]
+            audio_embeds, audio_embed_lens = self.perception(audios, audio_lens)
+            audio_embeds = [audio_embeds[i, :elen] for i, elen in enumerate(audio_embed_lens)]
             # Insert audio embeddings into relevant positions in text embeddings.
             input_embeds, _, attention_mask = replace_placeholders_and_build_targets(
                 input_ids=tokens,
@@ -642,7 +632,7 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
             #self.perception.asr.encoder = fully_shard(self.perception.asr.encoder, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
             register_fsdp_forward_method(self.perception, "forward_encoder")
-            register_fsdp_forward_method(self.perception, "transcribe_encoded")
+            # register_fsdp_forward_method(self.perception, "transcribe_encoded")
 
     @property
     def oomptimizer_schema(self) -> dict:
@@ -676,9 +666,9 @@ def setup_speech_encoder_with_asr(model: torch.nn.Module, pretrained_weights: bo
         model.cfg.output_dim = model.llm.config.hidden_size
     model.perception = AudioTranscriptionPerceptionModule(model.cfg.perception, model.cfg.pretrained_asr).train()
 
-    from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
+    # from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
 
-    WithOptionalCudaGraphs.disable_cuda_graphs_recursive(model.perception.asr, attribute_path="decoding.decoding")
+    # WithOptionalCudaGraphs.disable_cuda_graphs_recursive(model.perception.asr, attribute_path="decoding.decoding")
 
 
 def parse_hyp(answer: torch.Tensor, eos_tokens: list[int]):

@@ -187,13 +187,13 @@ class AudioTranscriptionPerceptionModule(NeuralModule, Exportable):
         adapter_subsampling = getattr(self.modality_adapter, "subsampling_factor", 1.0)
         return frame_shift * encoder_subsampling * adapter_subsampling
 
-    @property
-    def encoder(self) -> nn.Module:
-        return self.asr.encoder
+    # @property
+    # def encoder(self) -> nn.Module:
+    #     return self.asr.encoder
 
-    @property
-    def preprocessor(self) -> nn.Module:
-        return self.asr.preprocessor
+    # @property
+    # def preprocessor(self) -> nn.Module:
+    #     return self.asr.preprocessor
 
     def __init__(self, cfg: DictConfig, pretrained_asr: str):
         from nemo.collections.speechlm2.parts.pretrained import load_pretrained_nemo
@@ -201,10 +201,15 @@ class AudioTranscriptionPerceptionModule(NeuralModule, Exportable):
         super().__init__()
         # Initialize components
         self.cfg = cfg
-        self.asr = load_pretrained_nemo(ASRModel, pretrained_asr)
+        asr = load_pretrained_nemo(ASRModel, pretrained_asr)
         with open_dict(self.cfg):
-            self.cfg.asr = self.asr.cfg
+            self.cfg.asr = asr.cfg
         # self.asr = ASRModel.from_config_dict(cfg.asr)
+
+        # HACK: In this setting, we do not use ASR transcript, so we remove unused components
+        self.encoder = asr.encoder
+        self.preprocessor = asr.preprocessor
+
         self.spec_augmentation = None
         if 'spec_augment' in cfg and cfg.spec_augment is not None:
             self.spec_augmentation = self.from_config_dict(cfg.spec_augment)
@@ -263,13 +268,13 @@ class AudioTranscriptionPerceptionModule(NeuralModule, Exportable):
             encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
-    def transcribe_encoded(self, encoded, encoded_len):
-        if isinstance(encoded, list):
-            encoded = encoded[-1]
-            encoded_len = encoded_len[-1]
-        return self.asr._transcribe_output_processing(
-            outputs={"encoded": encoded, "encoded_len": encoded_len}, trcfg=TranscribeConfig()
-        )
+    # def transcribe_encoded(self, encoded, encoded_len):
+    #     if isinstance(encoded, list):
+    #         encoded = encoded[-1]
+    #         encoded_len = encoded_len[-1]
+    #     return self.asr._transcribe_output_processing(
+    #         outputs={"encoded": encoded, "encoded_len": encoded_len}, trcfg=TranscribeConfig()
+    #     )
 
     # disable type checks to avoid type-check errors when using Conformer as modality adapter
     @typecheck.disable_checks()
