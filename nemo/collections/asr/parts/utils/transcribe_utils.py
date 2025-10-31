@@ -365,6 +365,10 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
     if cfg.model_path is not None and cfg.model_path != "None":
         # restore model from .nemo file path
         model_cfg = ASRModel.restore_from(restore_path=cfg.model_path, return_config=True)
+
+        if "FastConformerCTCWithAdapterModel" in model_cfg.target:
+            model_cfg.target="nemo.collections.asr.models.fastconformer_ctc_with_adapter_model.FastConformerCTCWithAdapterModel"
+
         classpath = model_cfg.target  # original class path
         imported_class = model_utils.import_class_by_path(classpath)  # type: ASRModel
         logging.info(f"Restoring model : {imported_class.__name__}")

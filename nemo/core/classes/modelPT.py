@@ -899,7 +899,7 @@ class ModelPT(LightningModule, Model):
             if len(other_params):
                 param_groups = [{"params": other_params}] + param_groups
         else:
-            param_groups = [{"params": list(self.parameters())}]
+            param_groups = [{"params": list(p for p in self.parameters() if p.requires_grad)}]
 
         self._optimizer_param_groups = param_groups
 

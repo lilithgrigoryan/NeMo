@@ -14,6 +14,7 @@
 from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
 from .salm import SALM
+from .salm_asr_timestamping import SALMWithTimestamping
 from .salm_asr_decoder import SALMWithAsrDecoder
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     'DuplexS2SSpeechDecoderModel',
     'SALM',
     'SALMWithAsrDecoder',
+    'SALMWithTimestamping',
 ]

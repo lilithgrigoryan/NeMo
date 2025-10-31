@@ -71,7 +71,7 @@ import torch
 import transcribe_speech
 from omegaconf import MISSING, OmegaConf, open_dict
 
-from nemo.collections.asr.metrics.wer import word_error_rate
+from nemo.collections.asr.metrics.wer import word_error_rate, word_error_rate_detail
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     PunctuationCapitalization,
     TextProcessingConfig,
@@ -80,6 +80,14 @@ from nemo.collections.asr.parts.utils.transcribe_utils import (
 from nemo.collections.common.metrics.punct_er import DatasetPunctuationErrorRate
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+
+# Whisper normalizers (optional)
+try:
+    from whisper_normalizer.basic import BasicTextNormalizer
+    from whisper_normalizer.english import EnglishTextNormalizer
+    NORMALIZERS_AVAILABLE = True
+except ImportError:
+    NORMALIZERS_AVAILABLE = False
 
 
 @dataclass
@@ -98,6 +106,9 @@ class EvaluationConfig(transcribe_speech.TranscriptionConfig):
 
     only_score_manifest: bool = False
     scores_per_sample: bool = False
+    
+    # Whisper-style normalization (applied before text_processing)
+    use_normalizer: Optional[str] = None  # Options: "english", "basic", or None
 
     text_processing: Optional[TextProcessingConfig] = field(
         default_factory=lambda: TextProcessingConfig(
@@ -154,6 +165,23 @@ def main(cfg: EvaluationConfig):
 
             predicted_text.append(data["pred_text"])
 
+    # Apply whisper normalization if requested (before standard text processing)
+    if cfg.use_normalizer and cfg.use_normalizer.lower() not in ["none", "null"]:
+        if not NORMALIZERS_AVAILABLE:
+            logging.warning("whisper_normalizer not installed. Skipping normalization. Install with: pip install whisper-normalizer")
+        else:
+            normalizers = {
+                "english": EnglishTextNormalizer(),
+                "basic": BasicTextNormalizer(),
+            }
+            normalizer = normalizers.get(cfg.use_normalizer.lower())
+            if normalizer is None:
+                logging.warning(f"Unknown normalizer '{cfg.use_normalizer}'. Valid options: english, basic")
+            else:
+                logging.info(f"Applying {cfg.use_normalizer} normalization to references and hypotheses")
+                ground_truth_text = [normalizer(text) for text in ground_truth_text]
+                predicted_text = [normalizer(text) for text in predicted_text]
+
     pc = PunctuationCapitalization(cfg.text_processing.punctuation_marks)
     if cfg.text_processing.separate_punctuation:
         ground_truth_text = pc.separate_punctuation(ground_truth_text)
@@ -195,9 +223,9 @@ def main(cfg: EvaluationConfig):
             output_manifest_path=cfg.output_filename,
         )
 
-    # Compute the WER
+    # Compute the WER with detailed breakdown
     cer = word_error_rate(hypotheses=predicted_text, references=ground_truth_text, use_cer=True)
-    wer = word_error_rate(hypotheses=predicted_text, references=ground_truth_text, use_cer=False)
+    wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=predicted_text, references=ground_truth_text, use_cer=False)
 
     if cfg.use_cer:
         metric_name = 'CER'
@@ -212,7 +240,8 @@ def main(cfg: EvaluationConfig):
 
         logging.info(f'Got {metric_name} of {metric_value}. Tolerance was {cfg.tolerance}')
 
-    logging.info(f"Dataset WER/CER {wer:.2%}/{cer:.2%}")
+    logging.info(f"Dataset WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
+    logging.info(f"Dataset CER: {cer:.2%}")
 
     if cfg.use_punct_er:
         dper_obj.print()

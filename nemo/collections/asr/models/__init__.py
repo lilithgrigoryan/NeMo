@@ -44,7 +44,7 @@ from nemo.collections.asr.models.ssl_models import (
     SpeechEncDecSelfSupervisedModel,
 )
 from nemo.collections.asr.models.transformer_bpe_models import EncDecTransfModelBPE
-
+from nemo.collections.asr.models.fastconformer_ctc_with_adapter_model import FastConformerCTCWithAdapterModel
 __all__ = [
     'ASRModel',
     'ClassificationInferConfig',
@@ -72,4 +72,5 @@ __all__ = [
     'SLUIntentSlotBPEModel',
     'SortformerEncLabelModel',
     'SpeechEncDecSelfSupervisedModel',
+    'FastConformerCTCWithAdapterModel',
 ]
